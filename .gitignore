@@ -1,0 +1,34 @@
+# phpize / autoconf build artifacts
+/autom4te.cache/
+/build/
+/.deps/
+/.libs/
+/modules/
+/config.guess
+/config.h
+/config.h.in
+/config.log
+/config.nice
+/config.status
+/config.sub
+/configure
+/configure.ac
+/libtool
+/ltmain.sh
+/Makefile
+/Makefile.fragments
+/Makefile.global
+/Makefile.objects
+/mkinstalldirs
+/run-tests.php
+*.lo
+*.o
+*.so
+*.la
+*.dep
+
+# editor/OS noise
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
