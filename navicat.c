@@ -174,7 +174,21 @@ static void navicat_append_field_zstr(smart_str *body, const char *name, zend_st
  * other caller of this function. ntunnel_sqlite.php also requires a
  * `version` POST field to be *present* whenever actn is "2"/"3" (checked
  * with `isset()`, never actually read afterwards) -- its value is
- * therefore arbitrary; "1" satisfies the check. */
+ * therefore arbitrary; "1" satisfies the check.
+ *
+ * `encodeBase64` is always sent as "0" when there are no queries
+ * (`queries_count == 0`, i.e. every connect-time request), regardless of
+ * `conn->use_base64` -- a real, confirmed bug in Navicat's own current
+ * ntunnel_*.php scripts on PHP 8+: they all do
+ * `if ($_POST["encodeBase64"] == '1') { for ($i = 0; $i < count($_POST["q"]); ...) }`
+ * unconditionally, and `count(null)` (there is no "q" field at all on a
+ * connect request) is a fatal TypeError as of PHP 8.0, not just a warning
+ * like it used to be. Verified directly against a real, unmodified
+ * ntunnel_mysql.php running on PHP 8.4: `encodeBase64=1` with no `q[]`
+ * crashes the request outright; `encodeBase64=0` (this fix) does not.
+ * Since there is nothing to decode on a connect request either way, "0"
+ * here changes no real behavior -- `conn->use_base64` still governs
+ * actual query encoding once queries_count > 0. */
 static void navicat_build_fields(navicat_connection *conn, const char *actn, zend_string **queries, uint32_t queries_count, smart_str *body) {
 	uint32_t i;
 
@@ -198,7 +212,7 @@ static void navicat_build_fields(navicat_connection *conn, const char *actn, zen
 		navicat_append_field_zstr(body, "db", conn->db);
 	}
 
-	navicat_append_field(body, "encodeBase64", conn->use_base64 ? "1" : "0", 1);
+	navicat_append_field(body, "encodeBase64", (queries_count > 0 && conn->use_base64) ? "1" : "0", 1);
 
 	for (i = 0; i < queries_count; i++) {
 		char name[32];

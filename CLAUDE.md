@@ -178,15 +178,45 @@ sending it would just waste a round-trip on a query that errors out.
      rejected as throwing away real information for no reason.
    - `phpinfo()`'s "navicat backends" row updated from `"mysql"` to
      `"mysql, pgsql, sqlite"`.
-   - **Not yet tested against a real build or a real tunnel server** — see
-     "Status" below. Written directly against the real
-     `ntunnel_pgsql.php`/`ntunnel_sqlite.php` source (not guessed), and
-     reviewed carefully by hand (brace/paren balance, every new
-     `zval`/`zend_string` freed on every path) since Docker was occupied
-     with another build in this session and a real compile+run pass — the
-     same kind of check that already caught 3 real bugs in the original
-     mysql implementation (see "Status" below) — could not be done yet.
-2. **Minimal procedural API, not a class.** A connection is a plain Zend
+   - **✅ Fully verified end-to-end once Docker freed up (2026-09-16) — see
+     "Status" below for the full writeup.** Two more real bugs were found
+     this way (both in Navicat's own official tunnel scripts, not in this
+     extension — see decision 2 below for the fix and full details):
+     `encodeBase64=1` with no queries crashes `ntunnel_mysql.php`/
+     `ntunnel_pgsql.php`/`ntunnel_sqlite.php` outright on PHP 8+
+     (`count(null)`), and a genuine SQL error crashes `ntunnel_pgsql.php`
+     specifically (`pg_affected_rows(false)`, a function whose parameter
+     became strictly typed in PHP 8.1). Both were caught by running this
+     code for real, exactly the outcome that motivated flagging this as
+     "unverified" in the first place — proof, again, that reviewing
+     carefully by hand is not a substitute for actually compiling and
+     running.
+2. **`encodeBase64` is always sent as `"0"` for connect-time requests
+   (`actn=C`/`2`/`3`, i.e. whenever there are no queries), regardless of
+   the connection's own base64 setting — a real bug fix, not a style
+   choice.** Found while running the pgsql/sqlite end-to-end test below:
+   `navicat_connect()`'s own default (`use_base64 = 1`, inherited from
+   `px.ntunnel.class.php`'s own default) makes every connect request send
+   `encodeBase64=1` — and Navicat's own, current, unmodified
+   `ntunnel_*.php` scripts all do
+   `if ($_POST["encodeBase64"] == '1') { for ($i = 0; $i < count($_POST["q"]); ...) }`
+   unconditionally, with no `isset()`/`is_array()` guard on `$_POST["q"]`
+   first. A connect request never sends any `q[]` fields at all, so
+   `$_POST["q"]` is `null`, and `count(null)` — a silent `0`-returning
+   warning on PHP 7 — is a **fatal, uncaught `TypeError` as of PHP 8.0**.
+   Confirmed directly, twice: a raw `curl` POST with `encodeBase64=0`
+   against a real `ntunnel_mysql.php` on PHP 8.4 returns a clean, correct
+   51-byte binary response; the identical request with `encodeBase64=1`
+   instead returns nothing (the script dies) and the PHP dev server's own
+   log shows the exact `TypeError` at the `count($_POST["q"])` line. Since
+   there is nothing to decode on a connect request regardless of this
+   setting, forcing `"0"` there changes no real behavior — real query
+   requests (`actn=Q`, `queries_count > 0`) still honor
+   `conn->use_base64` exactly as before. This means any Navicat tunnel
+   host running PHP 8+ was previously **unreachable at all** through this
+   extension's default options, not just "using base64 needlessly" — a
+   correctness bug, not a minor inefficiency.
+3. **Minimal procedural API, not a class.** A connection is a plain Zend
    resource (`le_navicat_connection`) wrapping one reused `CURL*` easy
    handle plus the connection parameters (which must be resent on every
    request — see the protocol section above). No custom `zend_object`,
@@ -196,7 +226,7 @@ sending it would just waste a round-trip on a query that errors out.
    `getvar()` from the original `NTunnel` class are left as PHP-userland
    convenience helpers building on `navicat_query()` (not reimplemented in
    C) — only the network + binary-parsing core moved.
-3. **`mode: static` in `php-wasm-compiler`, fetched fresh from this repo's
+4. **`mode: static` in `php-wasm-compiler`, fetched fresh from this repo's
    own tagged GitHub releases** — the same convention that repo already
    uses for `yaml`/`mdhtml`/`jsonk` (its `compile/php/Dockerfile` `wget`s a
    tagged source tarball, no local `COPY`). Chosen over `mode: shared`
@@ -209,21 +239,21 @@ sending it would just waste a round-trip on a query that errors out.
    `__stack_pointer`/`__table_base` exports on complex side modules, see
    its CLAUDE.md decisions 32/42) entirely, since a `mode: static`
    extension never goes through that code path.
-4. **Also buildable `mode: shared` later, if ever needed.** Nothing about
+5. **Also buildable `mode: shared` later, if ever needed.** Nothing about
    this extension's design (a standard Zend resource, no custom object
    layout) is `mode: static`-specific — the only reason it starts static
-   is point 3's libcurl-reuse argument, not a technical constraint.
-5. **Native build first, WASM second** — same order `php-mdhtml` used.
+   is point 4's libcurl-reuse argument, not a technical constraint.
+6. **Native build first, WASM second** — same order `php-mdhtml` used.
    `config.m4` mirrors `php-mdhtml`'s dual-path `PHP_ARG_WITH` shape: bare
    `--with-navicat` uses `pkg-config` to find the system `libcurl` (fast
    local iteration, no Docker/Emscripten round-trip); an explicit
    `--with-navicat=DIR` points at a pre-built `libcurl` prefix instead
    (`php-wasm-compiler`'s own `/root/lib` convention, where `libcurl.a` has
    no `pkg-config` file of its own).
-6. **English for all repo content** (code, comments, docs, commit
+7. **English for all repo content** (code, comments, docs, commit
    messages); conversation with the maintainer stays in French — same
    convention as every other repo in this ecosystem.
-7. **License: GPL-2.0-or-later**, matching every other repo in the
+8. **License: GPL-2.0-or-later**, matching every other repo in the
    Kirigami ecosystem.
 
 ## Relationship to other repos
@@ -296,33 +326,82 @@ sufficient to trust without a real build:
    clobbered the correctly-escaped result with the original, unescaped
    input).
 
+**✅✅ `pgsql`/`sqlite` backends fully verified end-to-end (2026-09-16),
+against real MySQL/PostgreSQL servers and the real, unmodified, proprietary
+`ntunnel_*.php` scripts copied directly from a real Navicat Premium Lite
+17 install (`C:\Program Files\PremiumSoft\Navicat Premium Lite
+17\resource\httptunnel\`) — not mocks, and not the earlier
+protocol-write-up-derived approximation the mysql backend was first
+validated against.** Docker had been busy with another build when this
+backend was first written (hence the "reviewed by hand, not run yet"
+caveat that used to be here); once it freed up, the full setup was: a
+`docker network` with real `mysql:8` and `postgres:16-alpine` containers,
+a third `php:8.4-cli` container (with `mysqli`/`pgsql` built via
+`docker-php-ext-install`) serving the three real `ntunnel_*.php` files
+via `php -S`, running `navicat.so` against all three over real HTTP
+loopback + real TCP to the two database containers, and a real SQLite
+file for the sqlite backend (created fresh via `actn=3`, then reopened via
+plain `actn=C` to prove the server's own file-format auto-detection
+round-trips correctly). **37 real assertions, 0 failures** after two real
+bugs were found and fixed (see decision 2's `encodeBase64` fix above) and
+two more real, *upstream* (Navicat's own scripts, not this extension)
+PHP-8-incompatibility bugs were found and precisely diagnosed rather than
+worked around:
+
+- `ntunnel_mysql.php`/`ntunnel_pgsql.php`/`ntunnel_sqlite.php` all crash
+  outright (`count(): Argument #1 ($value) must be of type Countable|array,
+  null given`) on any request with `encodeBase64=1` and no `q[]` fields —
+  i.e. every connect request, on any host running PHP 8.0+. This is why
+  decision 2's fix exists; confirmed via a raw `curl` request with the
+  server's own log showing the exact uncaught `TypeError` and its file/line.
+- `ntunnel_pgsql.php` additionally crashes (`pg_affected_rows(): Argument
+  #1 ($result) must be of type PgSql\Result, false given`) on any genuine
+  SQL error, on any host running PHP 8.1+ (where pgsql's functions gained
+  strict object parameter types) — `pg_query()` returns `false` on error,
+  and the script calls `pg_affected_rows()`/`pg_num_fields()`/
+  `pg_num_rows()` on it unconditionally, with no `false` check first.
+  `navicat_query()` correctly reports this as `false` (a truncated/
+  malformed response, which is genuinely what it is once the script dies
+  mid-response) rather than papering over it — there is nothing this
+  extension could do differently here; the fix, if any, belongs in
+  Navicat's own script, which this repo doesn't own or ship. Neither of
+  these two script bugs is specific to the containers/versions used for
+  this test — they're structural, triggered by any PHP 8+ (first one) or
+  PHP 8.1+ (second one) host, which by 2026 is realistically most of them.
+- A real, benign upstream quirk (not a bug, just worth knowing): against
+  PostgreSQL 10+ (two-part version strings like `"16.4"`),
+  `ntunnel_pgsql.php`'s own `sscanf($version, "%d.%d.%d", ...)`
+  version-parsing (written for PostgreSQL 9.x's three-part `"9.6.3"`
+  style) fails to extract 3 fields, and its own two-part fallback right
+  after it *also* fails (no third `%s` component to match once the string
+  is exhausted) — so the connect response's version block is the literal
+  string `"0"` against any modern Postgres. `navicat_connection_info()`
+  faithfully reports whatever the server actually sent; there's nothing to
+  fix here on this extension's side.
+- `mysql`'s own original mock-server-based validation (below) was also
+  re-run against this session's real MySQL container as a regression
+  check, since `navicat_build_fields()`/`navicat_read_resultset()`/
+  `navicat_query()`/`navicat_multi_query()` were all touched by this same
+  change — all still pass.
+
 **Not done yet:**
 
-- `pgsql`/`sqlite` backends (point 1) — **✅ written (2026-09-16, see
-  decision 1), but not yet compiled or run.** Docker was busy with another
-  build in this session, so unlike the original mysql implementation
-  (which found 3 real bugs by actually compiling/running it), this code
-  has only been reviewed by hand so far. Treat it as unverified until a
-  real build + a mock `ntunnel_pgsql.php`/`ntunnel_sqlite.php` test (same
-  technique as the mysql one below) actually runs it.
 - `config.w32` (Windows/PECL build parity) — not started; `php-mdhtml`
   added its own later, as a separate pass, once a Windows build was
   actually wanted.
 - No GitHub tag/release yet — needed before `php-wasm-compiler` can fetch
   this repo the way it fetches `yaml`/`mdhtml`/`jsonk`.
-- No WASM build attempted yet (point 3's whole reason for existing) — the
+- No WASM build attempted yet (point 4's whole reason for existing) — the
   native build above only proves the protocol/parsing logic; linking
   against `php-wasm-compiler`'s own `/root/lib` `libcurl.a` (the
   `--with-navicat=DIR` path in `config.m4`) is still untested.
 - `vopen()`/`vclose()` from the original `px.ntunnel.class.php` were never
   implemented or needed here — this extension parses the curl response
   buffer directly rather than wrapping it in a stream handle.
-- No real Navicat/MySQL server was available to test against — the mock
-  tunnel server matches this file's own protocol write-up exactly, but
-  that write-up was itself derived from reading `ntunnel_mysql.php` rather
-  than from a byte capture of a real session, so a genuine end-to-end test
-  against a real Navicat deployment is still worth doing before calling
-  this production-ready.
-- **Nothing in this repo is committed yet** — still the initial untracked
-  working tree (`git status` shows zero commits). The fixes above are
-  applied to the working files, not yet committed or tagged.
+- No real Navicat *client* was ever pointed at these tunnel scripts (this
+  session validated the *server* scripts + this extension's own client
+  against real databases, both real, but never Navicat's own official
+  desktop client talking to the same tunnel) — a genuine end-to-end test
+  against a real Navicat deployment on the *client* side is still worth
+  doing before calling this production-ready, though the wire format is
+  now about as independently verified as it can be without that.
