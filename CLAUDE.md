@@ -29,11 +29,58 @@ so this extension adds no new WASM-side dependency).
 
 ## Protocol reference (reverse-engineered directly from Navicat's own
 server scripts — `ntunnel_mysql.php`/`ntunnel_pgsql.php`/`ntunnel_sqlite.php`,
-Navicat Premium Lite 17, `resource/httptunnel/`)
+read directly from a real `C:\Program Files\PremiumSoft\Navicat Premium
+Lite 17\resource\httptunnel\` install, 2026-09-16)
 
-The wire format is **identical across all three backends** — only the
-POST fields sent and the per-column type-code mapping differ. This repo
-implements the MySQL backend only (see "Decided architecture" below).
+The header/block/resultset-header framing below is **shared by all three
+backends**. What differs — corrected here after actually reading
+`ntunnel_pgsql.php`/`ntunnel_sqlite.php` side by side with the mysql one
+(the original version of this section, written before either file had
+been read, guessed "only the POST fields and the per-column type-code
+mapping differ" — true for pgsql, **not** true for sqlite, see below):
+
+- **mysql vs. pgsql: only the tunnel URL differs, not the wire format.**
+  `ntunnel_pgsql.php` takes the *exact same* POST fields as
+  `ntunnel_mysql.php` (`actn`, `host`, `port`, `login`, `password`, `db`,
+  `encodeBase64`, `q[]`) and replies with the exact same 16-byte
+  header + 3-block `actn=C` response + resultset framing. Its own libpq
+  connection string is built entirely server-side from those same fields
+  (`"host=... port=... dbname='...' user=... password=..."`) — the client
+  never sees or sends it. The only real differences are semantic, not
+  wire-level: `insertid` is always `0` (Postgres has no MySQL-style
+  auto-increment id concept the tunnel surfaces), and any query error
+  collapses to a generic `errno=1` (`pg_last_error($conn) <> ""`) rather
+  than a real driver error code.
+- **sqlite is genuinely different, at the byte level, not just in which
+  POST fields it takes.** It connects via `dbfile` (a server-side path,
+  no `host`/`port`/`login`/`password`/`db` at all) and `actn` means
+  something else entirely: `C` = test/use an *existing* file (the server
+  auto-detects SQLite2 vs SQLite3 from the file's own header bytes —
+  `"** This file contains an SQLite 2.1 database **"` vs. `"SQLite
+  format 3"` — the client never has to say which one it expects), while
+  `2`/`3` *create a new* database file as SQLite2/SQLite3 respectively
+  (only valid when the file doesn't already exist) and additionally
+  require a `version` POST field to merely be *present* (`isset()`
+  checked, its value is never actually read anywhere in the script — any
+  value satisfies it). `EchoConnInfo()`/`EchoConnInfo3()` send the *same*
+  version string 3 times (no separate host/protocol concept for an
+  embedded database). **The real wire-format difference**: SQLite's own
+  per-value dynamic typing means `EchoData()`/`EchoData3()` append one
+  *extra* 4-byte value-type code after **every** field value in every row
+  (`GetLongBinary(-2)` — the `SQLITE_TEXT` constant, hardcoded — for the
+  legacy SQLite2 path; `GetLongBinary($res->columnType($j))` — the real,
+  per-value SQLite3 type constant — for SQLite3), which mysql/pgsql never
+  send at all (their field *header*, sent once per column, is the only
+  place a type code appears). Correspondingly, sqlite's field *header*
+  carries a static, useless type placeholder (`-2` always for SQLite2;
+  `SQLITE3_NULL` always for SQLite3) — a caller that actually wants a
+  sqlite result's real per-value type has to read it from the row data,
+  not the header.
+
+This repo implements all three backends now (see "Decided architecture"
+below) — the MySQL-only scope note that used to be here (and the
+now-corrected "identical wire format" claim above it) reflected an
+earlier session that hadn't looked at the pgsql/sqlite scripts yet.
 
 **Request**: a single `POST` to the tunnel script's URL,
 `application/x-www-form-urlencoded`, always including `actn` (`C` = test
@@ -76,19 +123,69 @@ big-endian:
   - else (no result set, e.g. an `UPDATE`/`INSERT`): a single
     informational block (MySQL's own "N rows affected" string, or empty).
 
-This extension always sends `SET NAMES '<charset>'` as an extra query
-ahead of whatever the caller asked for (matching
+For mysql/pgsql, this extension always sends `SET NAMES '<charset>'` as an
+extra query ahead of whatever the caller asked for (matching
 `px.ntunnel.class.php::query()`/`multiquery()` exactly) and discards that
 extra resultset from the returned array — the tunnel has no independent
 "set the connection charset" action, this is the only way to control it.
+**sqlite never gets this injected query** — there is no `SET NAMES`
+equivalent for an embedded database (the tunnel is always UTF-8 there),
+and `ntunnel_sqlite.php` has nothing that would even parse it as a no-op;
+sending it would just waste a round-trip on a query that errors out.
 
 ## Decided architecture
 
-1. **MySQL only for v1.** `ntunnel_pgsql.php`/`ntunnel_sqlite.php` use the
-   exact same wire format (see above) — only the POST fields sent differ
-   (a libpq-style connstring for pgsql; `dbfile` + an `actn` of `2`/`3` to
-   pick the SQLite driver generation for sqlite). Adding either later is
-   almost entirely `navicat_build_fields()`-level work, not a new parser.
+1. **All three backends implemented (2026-09-16).** Originally scoped as
+   "MySQL only for v1" (the note that used to be here assumed
+   `ntunnel_pgsql.php`/`ntunnel_sqlite.php` would need only
+   `navicat_build_fields()`-level changes, without having actually read
+   either file yet) — revisited once the real scripts were read directly
+   from a local Navicat Premium Lite 17 install. That assumption held for
+   pgsql (see the Protocol reference section above: identical wire format,
+   only the tunnel URL differs) but not for sqlite (a real per-value wire
+   format difference, not just different POST fields). Added:
+   - `navicat_pg_connect(string $url, string $host, int $port, string
+     $user, string $password, string $db = '', array $options = [])` —
+     same signature as `navicat_connect()`, sharing its entire
+     implementation via a new `navicat_do_connect_hostbased()` static
+     helper parameterized by backend (mysql/pgsql send identical POST
+     fields, so no backend-specific branching was needed inside the
+     connect logic itself, only in `navicat_build_fields()`).
+   - `navicat_sqlite_connect(string $url, string $dbfile, array $options =
+     [])` — a distinct signature (no host/port/user/password/db), since
+     sqlite's connect semantics are genuinely different: `$options['create']
+     = 'sqlite2'|'sqlite3'` selects `actn=2`/`actn=3` to create a brand
+     new database file; omitting it uses `actn=C` against an existing file
+     (server-side format auto-detection, per the Protocol reference
+     section).
+   - `navicat_connection` gained a `backend` enum field
+     (`NAVICAT_BACKEND_MYSQL`/`PGSQL`/`SQLITE`) and a `dbfile` string
+     (sqlite only). `navicat_build_fields()` branches on `backend` to
+     decide which POST fields to send. `navicat_query()`/
+     `navicat_multi_query()` branch on `backend != NAVICAT_BACKEND_SQLITE`
+     to decide whether to inject `SET NAMES` and, correspondingly, which
+     resultset index is the caller's real query (index `1`/all-but-`0`
+     when injected, index `0`/all of them when not).
+   - `navicat_read_resultset()` gained a `value_types` parameter (set from
+     `conn->backend == NAVICAT_BACKEND_SQLITE` inside
+     `navicat_run_queries()`): when true, an extra `u32` is read after
+     every field value in every row (see the Protocol reference section)
+     and surfaced as a parallel `"valuetypes"` array (row-major, alongside
+     `"rows"`) in the resultset — sqlite's own field *header* type is a
+     useless static placeholder (see above), so this is the only way a
+     caller can actually learn a sqlite value's real per-value type;
+     discarding those 4 bytes instead of surfacing them was considered and
+     rejected as throwing away real information for no reason.
+   - `phpinfo()`'s "navicat backends" row updated from `"mysql"` to
+     `"mysql, pgsql, sqlite"`.
+   - **Not yet tested against a real build or a real tunnel server** — see
+     "Status" below. Written directly against the real
+     `ntunnel_pgsql.php`/`ntunnel_sqlite.php` source (not guessed), and
+     reviewed carefully by hand (brace/paren balance, every new
+     `zval`/`zend_string` freed on every path) since Docker was occupied
+     with another build in this session and a real compile+run pass — the
+     same kind of check that already caught 3 real bugs in the original
+     mysql implementation (see "Status" below) — could not be done yet.
 2. **Minimal procedural API, not a class.** A connection is a plain Zend
    resource (`le_navicat_connection`) wrapping one reused `CURL*` easy
    handle plus the connection parameters (which must be resent on every
@@ -201,7 +298,13 @@ sufficient to trust without a real build:
 
 **Not done yet:**
 
-- `pgsql`/`sqlite` backends (point 1).
+- `pgsql`/`sqlite` backends (point 1) — **✅ written (2026-09-16, see
+  decision 1), but not yet compiled or run.** Docker was busy with another
+  build in this session, so unlike the original mysql implementation
+  (which found 3 real bugs by actually compiling/running it), this code
+  has only been reviewed by hand so far. Treat it as unverified until a
+  real build + a mock `ntunnel_pgsql.php`/`ntunnel_sqlite.php` test (same
+  technique as the mysql one below) actually runs it.
 - `config.w32` (Windows/PECL build parity) — not started; `php-mdhtml`
   added its own later, as a separate pass, once a Windows build was
   actually wanted.

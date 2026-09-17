@@ -40,14 +40,34 @@
  * request -- the tunnel itself is stateless, see navicat_build_fields()).
  * ======================================================================== */
 
+/* The wire format is identical between mysql and pgsql (same POST field
+ * names, same resultset byte layout) -- confirmed by reading Navicat's own
+ * ntunnel_mysql.php/ntunnel_pgsql.php side by side, not assumed. sqlite is
+ * genuinely different: it connects via a `dbfile` (no host/port/login/
+ * password/db) and, per ntunnel_sqlite.php's EchoData()/EchoData3(), its
+ * resultset rows carry an extra 4-byte value-type code after *every* field
+ * value (SQLite has per-value dynamic typing, unlike MySQL/Postgres'
+ * per-column static typing) -- something the original CLAUDE.md protocol
+ * writeup, drafted before either script had actually been read, assumed
+ * away as "identical wire format, only the POST fields differ". See
+ * navicat_build_fields()/navicat_read_resultset() for where each backend's
+ * real difference is actually handled. */
+typedef enum {
+	NAVICAT_BACKEND_MYSQL = 0,
+	NAVICAT_BACKEND_PGSQL,
+	NAVICAT_BACKEND_SQLITE
+} navicat_backend;
+
 typedef struct _navicat_connection {
 	CURL *curl;
+	navicat_backend backend;
 	zend_string *url;
 	zend_string *host;
 	zend_long port;
 	zend_string *user;
 	zend_string *pass;
 	zend_string *db;
+	zend_string *dbfile; /* sqlite only */
 	zend_string *charset;
 	zend_bool use_base64;
 	zend_long timeout;
@@ -80,6 +100,7 @@ static void navicat_connection_free(navicat_connection *conn) {
 	navicat_release_str(&conn->user);
 	navicat_release_str(&conn->pass);
 	navicat_release_str(&conn->db);
+	navicat_release_str(&conn->dbfile);
 	navicat_release_str(&conn->charset);
 	navicat_release_str(&conn->info_host);
 	navicat_release_str(&conn->info_proto);
@@ -140,21 +161,43 @@ static void navicat_append_field_zstr(smart_str *body, const char *name, zend_st
  * `queries_count` is 0) are sent base64-encoded when the connection has
  * base64 mode on (the default -- avoids the tunnel's PHP host having to
  * deal with raw control bytes in $_POST), matching
- * px.ntunnel.class.php::fields(). */
+ * px.ntunnel.class.php::fields(). Field *order* doesn't matter --
+ * application/x-www-form-urlencoded is parsed by name on the PHP side --
+ * so branching by backend here doesn't need to preserve mysql's original
+ * field order for the fields the backends share.
+ *
+ * sqlite's own `actn` values mean something different from mysql/pgsql's
+ * ("C" = test/use an existing file, auto-detecting SQLite2 vs SQLite3 from
+ * its header; "2"/"3" = create a *new* database file as SQLite2/SQLite3
+ * respectively, per ntunnel_sqlite.php) -- `navicat_sqlite_connect()`
+ * passes the right one through its own `actn` argument, same as every
+ * other caller of this function. ntunnel_sqlite.php also requires a
+ * `version` POST field to be *present* whenever actn is "2"/"3" (checked
+ * with `isset()`, never actually read afterwards) -- its value is
+ * therefore arbitrary; "1" satisfies the check. */
 static void navicat_build_fields(navicat_connection *conn, const char *actn, zend_string **queries, uint32_t queries_count, smart_str *body) {
 	uint32_t i;
-	char portbuf[32];
-	int portlen;
 
 	memset(body, 0, sizeof(*body));
 
 	navicat_append_field(body, "actn", actn, strlen(actn));
-	navicat_append_field_zstr(body, "host", conn->host);
-	portlen = snprintf(portbuf, sizeof(portbuf), "%ld", (long) conn->port);
-	navicat_append_field(body, "port", portbuf, (size_t) portlen);
-	navicat_append_field_zstr(body, "login", conn->user);
-	navicat_append_field_zstr(body, "password", conn->pass);
-	navicat_append_field_zstr(body, "db", conn->db);
+
+	if (conn->backend == NAVICAT_BACKEND_SQLITE) {
+		navicat_append_field_zstr(body, "dbfile", conn->dbfile);
+		if (actn[0] == '2' || actn[0] == '3') {
+			navicat_append_field(body, "version", "1", 1);
+		}
+	} else {
+		char portbuf[32];
+		int portlen;
+		navicat_append_field_zstr(body, "host", conn->host);
+		portlen = snprintf(portbuf, sizeof(portbuf), "%ld", (long) conn->port);
+		navicat_append_field(body, "port", portbuf, (size_t) portlen);
+		navicat_append_field_zstr(body, "login", conn->user);
+		navicat_append_field_zstr(body, "password", conn->pass);
+		navicat_append_field_zstr(body, "db", conn->db);
+	}
+
 	navicat_append_field(body, "encodeBase64", conn->use_base64 ? "1" : "0", 1);
 
 	for (i = 0; i < queries_count; i++) {
@@ -333,8 +376,19 @@ static int navicat_read_header(navicat_reader *r, navicat_header *hdr, zend_stri
  * affectrows, insertid, numfields, numrows, fields, fieldnames, rows (or
  * just status/errno/info when numfields is 0). Returns 0 on truncated
  * input (the *out array, if partially built, is left for the caller to
- * dtor). */
-static int navicat_read_resultset(navicat_reader *r, zval *out) {
+ * dtor).
+ *
+ * `value_types` is only true for the sqlite backend: per the struct
+ * comment above navicat_connection, ntunnel_sqlite.php's EchoData()/
+ * EchoData3() append one extra u32 value-type code after *every* field
+ * value in a row (SQLite's own per-value dynamic typing -- its field
+ * *header* carries a static, useless placeholder type instead, e.g.
+ * always SQLITE3_NULL for the SQLite3 path). When true, those codes are
+ * read and returned as a "valuetypes" array (row-major, parallel to
+ * "rows") rather than silently discarded -- for sqlite, the header's
+ * "type" is not the real per-value type, so a caller has no other way to
+ * get it. */
+static int navicat_read_resultset(navicat_reader *r, zval *out, zend_bool value_types) {
 	uint32_t rs_errno, affectrows, insertid, numfields, numrows;
 
 	/* Initialized before any read can fail: navicat_read_resultsets() below
@@ -384,7 +438,7 @@ static int navicat_read_resultset(navicat_reader *r, zval *out) {
 	}
 
 	{
-		zval fields, fieldnames, rows;
+		zval fields, fieldnames, rows, valuetypes;
 		/* Kept alive only long enough to key each row by field name below
 		 * (array_combine($fieldnames, $row) in NTunnel_Resultset terms);
 		 * released once every row has been built. */
@@ -399,6 +453,9 @@ static int navicat_read_resultset(navicat_reader *r, zval *out) {
 		array_init(&fields);
 		array_init(&fieldnames);
 		array_init(&rows);
+		if (value_types) {
+			array_init(&valuetypes);
+		}
 
 		for (i = 0; ok && i < numfields; i++) {
 			zend_string *field_name = NULL, *table_name = NULL;
@@ -435,8 +492,11 @@ static int navicat_read_resultset(navicat_reader *r, zval *out) {
 		}
 
 		for (i = 0; ok && i < numrows; i++) {
-			zval row;
+			zval row, rowtypes;
 			array_init(&row);
+			if (value_types) {
+				array_init(&rowtypes);
+			}
 			for (j = 0; j < numfields; j++) {
 				zend_string *val = NULL;
 				zval v;
@@ -450,12 +510,27 @@ static int navicat_read_resultset(navicat_reader *r, zval *out) {
 					ZVAL_NULL(&v);
 				}
 				zend_hash_update(Z_ARRVAL(row), names[j], &v);
+
+				if (value_types) {
+					uint32_t vtype;
+					if (!navicat_reader_u32(r, &vtype)) {
+						ok = 0;
+						break;
+					}
+					add_next_index_long(&rowtypes, (zend_long) vtype);
+				}
 			}
 			if (!ok) {
 				zval_ptr_dtor(&row);
+				if (value_types) {
+					zval_ptr_dtor(&rowtypes);
+				}
 				break;
 			}
 			add_next_index_zval(&rows, &row);
+			if (value_types) {
+				add_next_index_zval(&valuetypes, &rowtypes);
+			}
 		}
 
 		for (i = 0; i < numfields; i++) {
@@ -467,12 +542,18 @@ static int navicat_read_resultset(navicat_reader *r, zval *out) {
 			zval_ptr_dtor(&fields);
 			zval_ptr_dtor(&fieldnames);
 			zval_ptr_dtor(&rows);
+			if (value_types) {
+				zval_ptr_dtor(&valuetypes);
+			}
 			return 0;
 		}
 
 		add_assoc_zval(out, "fields", &fields);
 		add_assoc_zval(out, "fieldnames", &fieldnames);
 		add_assoc_zval(out, "rows", &rows);
+		if (value_types) {
+			add_assoc_zval(out, "valuetypes", &valuetypes);
+		}
 	}
 
 	return 1;
@@ -480,12 +561,12 @@ static int navicat_read_resultset(navicat_reader *r, zval *out) {
 
 /* Reads every resultset in the response (one per query the request sent,
  * in order) into a numerically-indexed array. */
-static int navicat_read_resultsets(navicat_reader *r, zval *out) {
+static int navicat_read_resultsets(navicat_reader *r, zval *out, zend_bool value_types) {
 	array_init(out);
 	while (1) {
 		zval rs;
 		unsigned char more;
-		if (!navicat_read_resultset(r, &rs)) {
+		if (!navicat_read_resultset(r, &rs, value_types)) {
 			zval_ptr_dtor(&rs);
 			return 0;
 		}
@@ -511,7 +592,15 @@ ZEND_BEGIN_ARG_INFO_EX(arginfo_navicat_connect, 0, 0, 5)
 	ZEND_ARG_INFO(0, options)
 ZEND_END_ARG_INFO()
 
-PHP_FUNCTION(navicat_connect)
+/* Shared by navicat_connect() (mysql) and navicat_pg_connect() (pgsql) --
+ * ntunnel_mysql.php and ntunnel_pgsql.php take the exact same POST fields
+ * and reply with the exact same 3-block actn=C response (confirmed by
+ * reading both directly, not assumed), so the only thing that actually
+ * differs between the two backends is which tunnel script's URL the
+ * caller happens to point $url at; navicat_build_fields() already branches
+ * on conn->backend for the (identical, here) mysql/pgsql field set, so no
+ * further backend-specific logic is needed in this function itself. */
+static void navicat_do_connect_hostbased(INTERNAL_FUNCTION_PARAMETERS, navicat_backend backend, const char *fname)
 {
 	char *url, *host, *user, *pass, *db = NULL;
 	size_t url_len, host_len, user_len, pass_len, db_len = 0;
@@ -536,6 +625,7 @@ PHP_FUNCTION(navicat_connect)
 	ZEND_PARSE_PARAMETERS_END();
 
 	conn = ecalloc(1, sizeof(navicat_connection));
+	conn->backend = backend;
 	conn->url = zend_string_init(url, url_len, 0);
 	conn->host = zend_string_init(host, host_len, 0);
 	conn->port = port;
@@ -569,7 +659,7 @@ PHP_FUNCTION(navicat_connect)
 
 	conn->curl = curl_easy_init();
 	if (!conn->curl) {
-		php_error_docref(NULL, E_WARNING, "navicat_connect(): failed to initialize curl");
+		php_error_docref(NULL, E_WARNING, "%s(): failed to initialize curl", fname);
 		navicat_connection_free(conn);
 		RETURN_FALSE;
 	}
@@ -590,7 +680,7 @@ PHP_FUNCTION(navicat_connect)
 	if (!navicat_perform(conn, &body, &response, &error)) {
 		smart_str_free(&body);
 		smart_str_free(&response);
-		php_error_docref(NULL, E_WARNING, "navicat_connect(): %s", error ? ZSTR_VAL(error) : "unknown error");
+		php_error_docref(NULL, E_WARNING, "%s(): %s", fname, error ? ZSTR_VAL(error) : "unknown error");
 		navicat_release_str(&error);
 		navicat_connection_free(conn);
 		RETURN_FALSE;
@@ -603,7 +693,7 @@ PHP_FUNCTION(navicat_connect)
 
 	if (!navicat_read_header(&reader, &hdr, &error)) {
 		smart_str_free(&response);
-		php_error_docref(NULL, E_WARNING, "navicat_connect(): %s", error ? ZSTR_VAL(error) : "malformed response");
+		php_error_docref(NULL, E_WARNING, "%s(): %s", fname, error ? ZSTR_VAL(error) : "malformed response");
 		navicat_release_str(&error);
 		navicat_connection_free(conn);
 		RETURN_FALSE;
@@ -613,12 +703,155 @@ PHP_FUNCTION(navicat_connect)
 		zend_string *msg = NULL;
 		navicat_reader_block(&reader, &msg);
 		smart_str_free(&response);
-		php_error_docref(NULL, E_WARNING, "navicat_connect(): tunnel error %u: %s", (unsigned) hdr.errno_, msg ? ZSTR_VAL(msg) : "");
+		php_error_docref(NULL, E_WARNING, "%s(): tunnel error %u: %s", fname, (unsigned) hdr.errno_, msg ? ZSTR_VAL(msg) : "");
 		navicat_release_str(&msg);
 		navicat_connection_free(conn);
 		RETURN_FALSE;
 	}
 
+	navicat_reader_block(&reader, &conn->info_host);
+	navicat_reader_block(&reader, &conn->info_proto);
+	navicat_reader_block(&reader, &conn->info_version);
+	smart_str_free(&response);
+
+	RETURN_RES(zend_register_resource(conn, le_navicat_connection));
+}
+
+PHP_FUNCTION(navicat_connect)
+{
+	navicat_do_connect_hostbased(INTERNAL_FUNCTION_PARAM_PASSTHRU, NAVICAT_BACKEND_MYSQL, "navicat_connect");
+}
+
+PHP_FUNCTION(navicat_pg_connect)
+{
+	navicat_do_connect_hostbased(INTERNAL_FUNCTION_PARAM_PASSTHRU, NAVICAT_BACKEND_PGSQL, "navicat_pg_connect");
+}
+
+ZEND_BEGIN_ARG_INFO_EX(arginfo_navicat_sqlite_connect, 0, 0, 2)
+	ZEND_ARG_INFO(0, url)
+	ZEND_ARG_INFO(0, dbfile)
+	ZEND_ARG_INFO(0, options)
+ZEND_END_ARG_INFO()
+
+/* ntunnel_sqlite.php's own actn=C tests/uses an *existing* $dbfile,
+ * auto-detecting SQLite2 vs SQLite3 from the file's own header bytes --
+ * the client never needs to say which one it expects. Creating a *new*
+ * database file instead needs an explicit actn of "2" or "3" (there is no
+ * "auto" option when the file doesn't exist yet, since there is nothing to
+ * sniff), selected here via $options['create'] = 'sqlite2'|'sqlite3'. */
+PHP_FUNCTION(navicat_sqlite_connect)
+{
+	char *url, *dbfile;
+	size_t url_len, dbfile_len;
+	zval *options = NULL;
+	navicat_connection *conn;
+	const char *proxy = NULL;
+	const char *actn = "C";
+	smart_str body = {0}, response = {0};
+	zend_string *error = NULL;
+	navicat_reader reader;
+	navicat_header hdr;
+
+	ZEND_PARSE_PARAMETERS_START(2, 3)
+		Z_PARAM_STRING(url, url_len)
+		Z_PARAM_STRING(dbfile, dbfile_len)
+		Z_PARAM_OPTIONAL
+		Z_PARAM_ARRAY(options)
+	ZEND_PARSE_PARAMETERS_END();
+
+	conn = ecalloc(1, sizeof(navicat_connection));
+	conn->backend = NAVICAT_BACKEND_SQLITE;
+	conn->url = zend_string_init(url, url_len, 0);
+	conn->dbfile = zend_string_init(dbfile, dbfile_len, 0);
+	conn->charset = zend_string_init(ZEND_STRL("utf8"), 0);
+	conn->use_base64 = 1;
+	conn->timeout = 600;
+	conn->conntimeout = 30;
+
+	if (options) {
+		zval *tmp;
+		if ((tmp = zend_hash_str_find(Z_ARRVAL_P(options), ZEND_STRL("create"))) != NULL && Z_TYPE_P(tmp) == IS_STRING) {
+			if (zend_string_equals_literal(Z_STR_P(tmp), "sqlite2")) {
+				actn = "2";
+			} else if (zend_string_equals_literal(Z_STR_P(tmp), "sqlite3")) {
+				actn = "3";
+			} else {
+				php_error_docref(NULL, E_WARNING,
+					"navicat_sqlite_connect(): options['create'] must be 'sqlite2' or 'sqlite3'");
+				navicat_connection_free(conn);
+				RETURN_FALSE;
+			}
+		}
+		if ((tmp = zend_hash_str_find(Z_ARRVAL_P(options), ZEND_STRL("base64"))) != NULL) {
+			conn->use_base64 = zend_is_true(tmp);
+		}
+		if ((tmp = zend_hash_str_find(Z_ARRVAL_P(options), ZEND_STRL("timeout"))) != NULL) {
+			conn->timeout = zval_get_long(tmp);
+		}
+		if ((tmp = zend_hash_str_find(Z_ARRVAL_P(options), ZEND_STRL("conntimeout"))) != NULL) {
+			conn->conntimeout = zval_get_long(tmp);
+		}
+		if ((tmp = zend_hash_str_find(Z_ARRVAL_P(options), ZEND_STRL("proxy"))) != NULL && Z_TYPE_P(tmp) == IS_STRING) {
+			proxy = Z_STRVAL_P(tmp);
+		}
+	}
+
+	conn->curl = curl_easy_init();
+	if (!conn->curl) {
+		php_error_docref(NULL, E_WARNING, "navicat_sqlite_connect(): failed to initialize curl");
+		navicat_connection_free(conn);
+		RETURN_FALSE;
+	}
+
+	curl_easy_setopt(conn->curl, CURLOPT_URL, ZSTR_VAL(conn->url));
+	curl_easy_setopt(conn->curl, CURLOPT_SSL_VERIFYPEER, 0L);
+	curl_easy_setopt(conn->curl, CURLOPT_SSL_VERIFYHOST, 0L);
+	curl_easy_setopt(conn->curl, CURLOPT_FOLLOWLOCATION, 1L);
+	curl_easy_setopt(conn->curl, CURLOPT_POST, 1L);
+	curl_easy_setopt(conn->curl, CURLOPT_TIMEOUT, (long) conn->timeout);
+	curl_easy_setopt(conn->curl, CURLOPT_CONNECTTIMEOUT, (long) conn->conntimeout);
+	curl_easy_setopt(conn->curl, CURLOPT_USERAGENT, "Navicat HTTP Tunnel");
+	if (proxy) {
+		curl_easy_setopt(conn->curl, CURLOPT_PROXY, proxy);
+	}
+
+	navicat_build_fields(conn, actn, NULL, 0, &body);
+	if (!navicat_perform(conn, &body, &response, &error)) {
+		smart_str_free(&body);
+		smart_str_free(&response);
+		php_error_docref(NULL, E_WARNING, "navicat_sqlite_connect(): %s", error ? ZSTR_VAL(error) : "unknown error");
+		navicat_release_str(&error);
+		navicat_connection_free(conn);
+		RETURN_FALSE;
+	}
+	smart_str_free(&body);
+
+	reader.data = (const unsigned char *) navicat_smart_str_val(&response);
+	reader.len = navicat_smart_str_len(&response);
+	reader.pos = 0;
+
+	if (!navicat_read_header(&reader, &hdr, &error)) {
+		smart_str_free(&response);
+		php_error_docref(NULL, E_WARNING, "navicat_sqlite_connect(): %s", error ? ZSTR_VAL(error) : "malformed response");
+		navicat_release_str(&error);
+		navicat_connection_free(conn);
+		RETURN_FALSE;
+	}
+
+	if (hdr.errno_ != 0) {
+		zend_string *msg = NULL;
+		navicat_reader_block(&reader, &msg);
+		smart_str_free(&response);
+		php_error_docref(NULL, E_WARNING, "navicat_sqlite_connect(): tunnel error %u: %s", (unsigned) hdr.errno_, msg ? ZSTR_VAL(msg) : "");
+		navicat_release_str(&msg);
+		navicat_connection_free(conn);
+		RETURN_FALSE;
+	}
+
+	/* ntunnel_sqlite.php's EchoConnInfo()/EchoConnInfo3() send the same
+	 * version string 3 times (there's no separate host/protocol concept
+	 * for an embedded database) -- reusing the mysql/pgsql 3-block layout
+	 * here is accurate to the real protocol, not a simplification. */
 	navicat_reader_block(&reader, &conn->info_host);
 	navicat_reader_block(&reader, &conn->info_proto);
 	navicat_reader_block(&reader, &conn->info_version);
@@ -652,8 +885,9 @@ PHP_FUNCTION(navicat_connection_info)
 }
 
 /* Shared by navicat_query()/navicat_multi_query(): sends `count` queries
- * (already including the leading "SET NAMES ..." this extension always
- * injects, matching px.ntunnel.class.php's own query()/multiquery()), and
+ * (the caller decides whether to prepend a "SET NAMES ..." charset query,
+ * matching px.ntunnel.class.php's own query()/multiquery() for mysql/pgsql
+ * -- sqlite has no such statement and skips it, see navicat_query()), and
  * either returns the parsed resultsets array or leaves the connection's
  * last_error set and returns 0. */
 static int navicat_run_queries(navicat_connection *conn, zend_string **queries, uint32_t count, zval *out_sets) {
@@ -689,7 +923,7 @@ static int navicat_run_queries(navicat_connection *conn, zend_string **queries, 
 		return 0;
 	}
 
-	if (!navicat_read_resultsets(&reader, out_sets)) {
+	if (!navicat_read_resultsets(&reader, out_sets, conn->backend == NAVICAT_BACKEND_SQLITE)) {
 		zval_ptr_dtor(out_sets);
 		smart_str_free(&response);
 		navicat_set_last_error(conn, zend_string_init(ZEND_STRL("malformed resultset in tunnel response"), 0));
@@ -712,6 +946,8 @@ PHP_FUNCTION(navicat_query)
 	size_t query_len;
 	navicat_connection *conn;
 	zend_string *queries[2];
+	uint32_t count;
+	zend_bool inject_charset;
 	zval sets;
 	zval *real;
 
@@ -725,20 +961,37 @@ PHP_FUNCTION(navicat_query)
 		RETURN_FALSE;
 	}
 
-	queries[0] = strpprintf(0, "SET NAMES '%s'", ZSTR_VAL(conn->charset));
-	queries[1] = zend_string_init(query, query_len, 0);
+	/* sqlite has no "SET NAMES"/connection-charset concept at all -- the
+	 * tunnel is always UTF-8 there -- and ntunnel_sqlite.php has no
+	 * equivalent statement to run, so injecting one would just waste a
+	 * round-trip on a query that always errors out. */
+	inject_charset = (conn->backend != NAVICAT_BACKEND_SQLITE);
+	if (inject_charset) {
+		queries[0] = strpprintf(0, "SET NAMES '%s'", ZSTR_VAL(conn->charset));
+		queries[1] = zend_string_init(query, query_len, 0);
+		count = 2;
+	} else {
+		queries[0] = zend_string_init(query, query_len, 0);
+		count = 1;
+	}
 
-	if (!navicat_run_queries(conn, queries, 2, &sets)) {
+	if (!navicat_run_queries(conn, queries, count, &sets)) {
 		zend_string_release(queries[0]);
-		zend_string_release(queries[1]);
+		if (inject_charset) {
+			zend_string_release(queries[1]);
+		}
 		RETURN_FALSE;
 	}
 	zend_string_release(queries[0]);
-	zend_string_release(queries[1]);
+	if (inject_charset) {
+		zend_string_release(queries[1]);
+	}
 
-	/* sets[0] is the injected "SET NAMES ..." resultset (discarded); sets[1]
-	 * is the real query's, matching NTunnel::query()'s array_pop($sets). */
-	real = zend_hash_index_find(Z_ARRVAL(sets), 1);
+	/* When a "SET NAMES ..." was injected, sets[0] is its own (discarded)
+	 * resultset and sets[1] is the real query's -- matching
+	 * NTunnel::query()'s array_pop($sets). Without it (sqlite), the real
+	 * query is sets[0] directly. */
+	real = zend_hash_index_find(Z_ARRVAL(sets), inject_charset ? 1 : 0);
 	if (!real) {
 		zval_ptr_dtor(&sets);
 		RETURN_FALSE;
@@ -756,7 +1009,8 @@ PHP_FUNCTION(navicat_multi_query)
 {
 	zval *zres, *queries_arr, *val;
 	navicat_connection *conn;
-	uint32_t n, i;
+	uint32_t n, i, total;
+	zend_bool inject_charset;
 	zend_string **queries;
 	zval sets, *item;
 	uint32_t idx;
@@ -777,31 +1031,38 @@ PHP_FUNCTION(navicat_multi_query)
 		return;
 	}
 
-	queries = safe_emalloc(n + 1, sizeof(zend_string *), 0);
-	queries[0] = strpprintf(0, "SET NAMES '%s'", ZSTR_VAL(conn->charset));
-	i = 1;
+	/* See navicat_query() for why sqlite gets no injected "SET NAMES ...". */
+	inject_charset = (conn->backend != NAVICAT_BACKEND_SQLITE);
+	total = inject_charset ? n + 1 : n;
+	queries = safe_emalloc(total, sizeof(zend_string *), 0);
+	i = 0;
+	if (inject_charset) {
+		queries[0] = strpprintf(0, "SET NAMES '%s'", ZSTR_VAL(conn->charset));
+		i = 1;
+	}
 	ZEND_HASH_FOREACH_VAL(Z_ARRVAL_P(queries_arr), val) {
 		queries[i++] = zval_get_string(val);
 	} ZEND_HASH_FOREACH_END();
 
-	if (!navicat_run_queries(conn, queries, n + 1, &sets)) {
-		for (i = 0; i < n + 1; i++) {
+	if (!navicat_run_queries(conn, queries, total, &sets)) {
+		for (i = 0; i < total; i++) {
 			zend_string_release(queries[i]);
 		}
 		efree(queries);
 		RETURN_FALSE;
 	}
-	for (i = 0; i < n + 1; i++) {
+	for (i = 0; i < total; i++) {
 		zend_string_release(queries[i]);
 	}
 	efree(queries);
 
-	/* Drop index 0 (the injected "SET NAMES ...") and reindex, matching
-	 * NTunnel::multiquery()'s array_shift($sets). */
+	/* When a "SET NAMES ..." was injected, drop index 0 and reindex,
+	 * matching NTunnel::multiquery()'s array_shift($sets). Without it
+	 * (sqlite), every resultset is a real one -- keep them all. */
 	array_init(return_value);
 	idx = 0;
 	ZEND_HASH_FOREACH_VAL(Z_ARRVAL(sets), item) {
-		if (idx > 0) {
+		if (!inject_charset || idx > 0) {
 			Z_TRY_ADDREF_P(item);
 			add_next_index_zval(return_value, item);
 		}
@@ -932,6 +1193,8 @@ PHP_FUNCTION(navicat_escape)
 
 static const zend_function_entry navicat_functions[] = {
 	PHP_FE(navicat_connect, arginfo_navicat_connect)
+	PHP_FE(navicat_pg_connect, arginfo_navicat_connect)
+	PHP_FE(navicat_sqlite_connect, arginfo_navicat_sqlite_connect)
 	PHP_FE(navicat_connection_info, arginfo_navicat_connection_info)
 	PHP_FE(navicat_query, arginfo_navicat_query)
 	PHP_FE(navicat_multi_query, arginfo_navicat_multi_query)
@@ -970,7 +1233,7 @@ PHP_MINFO_FUNCTION(navicat)
 		"alt=\"Kirigami\" height=\"40\" /></td></tr>\n"
 	);
 	php_info_print_table_row(2, "navicat support", "enabled");
-	php_info_print_table_row(2, "navicat backends", "mysql");
+	php_info_print_table_row(2, "navicat backends", "mysql, pgsql, sqlite");
 	php_info_print_table_row(2, "libcurl version", curl_version());
 	php_info_print_table_end();
 }

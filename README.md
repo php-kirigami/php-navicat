@@ -6,7 +6,7 @@
 
 # php-navicat
 
-A native PHP client for **Navicat's own HTTP-tunnel protocol** — MySQL for now.
+A native PHP client for **Navicat's own HTTP-tunnel protocol** — MySQL, PostgreSQL, and SQLite.
 
 [![License: GPL-2.0-or-later](https://img.shields.io/badge/license-GPL--2.0--or--later-yellow)](./LICENSE)
 [![PHP 8.5](https://img.shields.io/badge/php-8.5-777bb4)](https://www.php.net/releases/8.5/)
@@ -43,6 +43,8 @@ Part of the **Kirigami** project ecosystem.
   - [Status](#status)
   - [API](#api)
     - [`navicat_connect()`](#navicat_connect)
+    - [`navicat_pg_connect()`](#navicat_pg_connect)
+    - [`navicat_sqlite_connect()`](#navicat_sqlite_connect)
     - [`navicat_connection_info()`](#navicat_connection_info)
     - [`navicat_query()`](#navicat_query)
     - [`navicat_multi_query()`](#navicat_multi_query)
@@ -90,6 +92,46 @@ Opens a connection and validates it against the tunnel (the protocol's
 (default `utf8`), `base64` (default `true`), `timeout` (default `600`),
 `conntimeout` (default `30`), and `proxy`.
 
+### `navicat_pg_connect()`
+
+```php
+navicat_pg_connect(
+    string $url,
+    string $host,
+    int $port,
+    string $user,
+    string $password,
+    string $db = '',
+    array $options = []
+): resource|false
+```
+
+Same signature, same options, and the same wire protocol as
+`navicat_connect()` — Navicat's `ntunnel_pgsql.php` takes the exact same
+POST fields as `ntunnel_mysql.php` (confirmed by reading both directly).
+Only the URL you point `$url` at (your own `ntunnel_pgsql.php`) actually
+selects the backend. `$db` defaults to Postgres' own `template1` on the
+server side when left empty.
+
+### `navicat_sqlite_connect()`
+
+```php
+navicat_sqlite_connect(
+    string $url,
+    string $dbfile,
+    array $options = []
+): resource|false
+```
+
+Connects to a SQLite database file (a server-side path, resolved by the
+tunnel script — no host/port/credentials). By default (`$options` without
+`create`) this tests/uses an *existing* file, auto-detected server-side as
+SQLite2 or SQLite3 from its own header bytes. Pass `$options['create'] =
+'sqlite2'` or `'sqlite3'` to instead create a brand-new database file (only
+valid when `$dbfile` doesn't already exist). `$options` also accepts
+`base64`, `timeout`, `conntimeout`, and `proxy` (no `charset` — sqlite has
+no connection-charset concept, see [`navicat_query()`](#navicat_query)).
+
 ### `navicat_connection_info()`
 
 ```php
@@ -108,7 +150,17 @@ navicat_query(resource $connection, string $query): array|false
 Runs one query and returns its resultset: `status`, `errno`, `errmsg`,
 `affectrows`, `insertid`, `numfields`, `numrows`, and — when
 `numfields > 0` — `fields` (per-column name/table/type/flags/length),
-`fieldnames`, and `rows` (each a `fieldname => value` associative array).
+`fieldnames`, `rows` (each a `fieldname => value` associative array), and,
+**for `navicat_sqlite_connect()` connections only**, `valuetypes` — a
+row-major array (parallel to `rows`) of each value's real SQLite type
+code. SQLite has per-value dynamic typing, so — unlike mysql/pgsql — its
+`fields[]` header type is a useless static placeholder; `valuetypes` is
+the only place a sqlite result's real per-value type is available.
+
+For mysql/pgsql connections, this always runs an extra `SET NAMES
+'<charset>'` ahead of your query and discards its resultset — the tunnel
+has no independent "set the connection charset" action. sqlite connections
+never send this (no such statement, no connection-charset concept there).
 
 ### `navicat_multi_query()`
 
