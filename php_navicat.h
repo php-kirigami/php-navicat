@@ -15,7 +15,7 @@
 extern zend_module_entry navicat_module_entry;
 #define phpext_navicat_ptr &navicat_module_entry
 
-#define PHP_NAVICAT_VERSION "0.1.4"
+#define PHP_NAVICAT_VERSION "0.1.5"
 
 #ifdef PHP_WIN32
 # define PHP_NAVICAT_API __declspec(dllexport)

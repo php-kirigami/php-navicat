@@ -1235,6 +1235,7 @@ PHP_MINFO_FUNCTION(navicat)
 {
 	php_info_print_table_start();
 	php_info_print_table_row(2, "navicat support", "enabled");
+	php_info_print_table_row(2, "version", PHP_NAVICAT_VERSION);
 	php_info_print_table_row(2, "navicat backends", "mysql, pgsql, sqlite");
 	php_info_print_table_row(2, "libcurl version", curl_version());
 	/* php_info_print_table_row()/_header() don't escape their arguments,
