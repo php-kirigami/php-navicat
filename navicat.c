@@ -32,7 +32,7 @@
  * over a single POST request/response. Reverse-engineered from those
  * scripts directly (they are the only spec that exists) plus the
  * pre-existing PHP-only client this extension replaces the network core
- * of; see CLAUDE.md for the full protocol writeup and every decision.
+ * of; see docs/PROTOCOL.md and docs/DECISIONS.md.
  *
  * Deliberately minimal/procedural (no PHP class, no custom zend_object):
  * a connection is a plain Zend resource wrapping one reused CURL easy
@@ -47,7 +47,7 @@
  * password/db) and, per ntunnel_sqlite.php's EchoData()/EchoData3(), its
  * resultset rows carry an extra 4-byte value-type code after *every* field
  * value (SQLite has per-value dynamic typing, unlike MySQL/Postgres'
- * per-column static typing) -- something the original CLAUDE.md protocol
+ * per-column static typing) -- something the original docs/PROTOCOL.md protocol
  * writeup, drafted before either script had actually been read, assumed
  * away as "identical wire format, only the POST fields differ". See
  * navicat_build_fields()/navicat_read_resultset() for where each backend's

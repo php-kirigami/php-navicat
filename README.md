@@ -61,9 +61,14 @@ Part of the **Kirigami** project ecosystem.
 
 ## Status
 
-Native build succeeds and the wire protocol has been validated end-to-end
-against a mock tunnel server. See [CLAUDE.md](CLAUDE.md) for the full
-protocol writeup and every decision made so far.
+Native build verified end-to-end for all three backends (mysql, pgsql,
+sqlite) against real databases and Navicat's own tunnel scripts. Statically
+linked into
+[`@kirigami/php-wasm`](https://github.com/php-kirigami/kirigami/tree/main/packages/php-wasm),
+where it loads but hasn't been exercised against a tunnel yet. See
+[docs/PROTOCOL.md](docs/PROTOCOL.md) for the wire protocol,
+[docs/DECISIONS.md](docs/DECISIONS.md) for the decisions, and
+[docs/STATUS.md](docs/STATUS.md) for what's verified.
 
 ---
 
